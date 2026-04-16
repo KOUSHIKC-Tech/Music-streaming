@@ -1,16 +1,14 @@
-import socket
-import os
-import time
 import hashlib
+import os
+import socket
+import subprocess
 
-HOST = '127.0.0.1'
+HOST = "127.0.0.1"
 PORT = 5000
-
-client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client.connect((HOST, PORT))
-
 END_MARKER = b"END_OF_T"
-END_MARKER_LEN = len(END_MARKER)
+BUFFER_SECONDS = 10
+ESTIMATED_BYTES_PER_SECOND = 32000
+BUFFER_START_BYTES = BUFFER_SECONDS * ESTIMATED_BYTES_PER_SECOND
 
 
 def recv_exact(sock, n):
@@ -35,121 +33,142 @@ def recv_line(sock):
     return line.decode()
 
 
-# Receive song list
-song_list = client.recv(4096).decode()
-songs = song_list.split(",")
+def play_in_media_player(file_path):
+    abs_path = os.path.abspath(file_path)
+    wmplayer = r"C:\Program Files (x86)\Windows Media Player\wmplayer.exe"
+    if os.path.exists(wmplayer):
+        subprocess.Popen([wmplayer, abs_path], creationflags=subprocess.CREATE_NO_WINDOW)
+    else:
+        os.startfile(abs_path)
+
+
+def open_downloaded_file(file_path):
+    os.startfile(os.path.abspath(file_path))
+
+
+client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client.connect((HOST, PORT))
+
+songs = client.recv(4096).decode().split(",")
 
 print("Available songs:")
 for i, song in enumerate(songs):
-    print(f"{i+1}. {song}")
+    print(f"{i + 1}. {song}")
 
 choice = int(input("Enter song number: ")) - 1
-selected_song = songs[choice]
+client.send(songs[choice].encode())
 
-client.send(selected_song.encode())
+status = recv_line(client)
 
-status_line = recv_line(client)
-
-if status_line == "ERROR":
+if status == "ERROR":
     print("Song not found")
 else:
-    # Receive expected file size
     expected_size = int(recv_line(client))
-    print(f"Expected file size: {expected_size} bytes")
-
-    # Receive expected MD5 hash
     expected_hash = recv_line(client)
-    print(f"Expected MD5 hash: {expected_hash}")
-
-    # Receive total number of packets
     total_packets = int(recv_line(client))
+
+    print(f"Streaming started ({expected_size} bytes)...")
+    print(f"Expected MD5: {expected_hash}")
     print(f"Total packets expected: {total_packets}")
 
-    start_time = time.time()
+    stream_file = "stream.mp3"
+    buffer_file = "stream_buffer.mp3"
+    final_file = "received.mp3"
 
-    # Track received packets
+    if os.path.exists(stream_file):
+        os.remove(stream_file)
+    if os.path.exists(buffer_file):
+        os.remove(buffer_file)
+
+    f_stream = open(stream_file, "wb")
+    f_buffer = open(buffer_file, "wb")
+
     received_packets = {}
     received_data = {}
 
+    bytes_written = 0
+    started = False
+    initial_packets_received = 0
+    retransmitted_packets_received = 0
+
     while True:
-        header = recv_exact(client, END_MARKER_LEN)
-        if header is None:
+        header = recv_exact(client, 8)
+        if not header:
             break
         if header == END_MARKER:
             break
 
-        seq_num = int.from_bytes(header[:4], 'big')
-        length = int.from_bytes(header[4:], 'big')
+        seq = int.from_bytes(header[:4], "big")
+        length = int.from_bytes(header[4:], "big")
         data = recv_exact(client, length)
-        if data is None:
-            break
 
-        received_packets[seq_num] = True
-        received_data[seq_num] = data
+        received_packets[seq] = True
+        received_data[seq] = data
+        initial_packets_received += 1
 
-    # Check for missing packets
-    missing_packets = []
-    for i in range(total_packets):
-        if i not in received_packets:
-            missing_packets.append(i)
+        f_stream.write(data)
+        f_stream.flush()
 
-    print(f"Initial transfer complete. Missing {len(missing_packets)} packets")
+        f_buffer.write(data)
+        f_buffer.flush()
+        bytes_written += len(data)
 
-    # Request retransmission of missing packets
-    if missing_packets:
-        missing_str = ",".join(map(str, missing_packets))
-        client.sendall(f"MISSING:{missing_str}".encode())
-        
-        # Receive retransmitted packets
+        # Start the media player after buffering about 10 seconds of audio.
+        if not started and bytes_written >= BUFFER_START_BYTES:
+            try:
+                print(
+                    f"Buffered about {BUFFER_SECONDS} seconds. "
+                    "Starting media player with buffer file..."
+                )
+                play_in_media_player(buffer_file)
+                started = True
+            except OSError:
+                print("Could not start media player. Will open the finished song.")
+
+    f_stream.close()
+    f_buffer.close()
+    print(f"Initial packets received: {initial_packets_received}")
+
+    missing = [i for i in range(total_packets) if i not in received_packets]
+    print(f"Missing packet count: {len(missing)}")
+    if missing:
+        print(f"Missing packet numbers: {missing}")
+
+    if missing:
+        client.sendall(("MISSING:" + ",".join(map(str, missing))).encode())
+        print(f"Requested retransmission for {len(missing)} packets")
+
         while True:
-            header = recv_exact(client, END_MARKER_LEN)
-            if header is None:
-                break
-            if header == END_MARKER:
+            header = recv_exact(client, 8)
+            if not header or header == END_MARKER:
                 break
 
-            seq_num = int.from_bytes(header[:4], 'big')
-            length = int.from_bytes(header[4:], 'big')
+            seq = int.from_bytes(header[:4], "big")
+            length = int.from_bytes(header[4:], "big")
             data = recv_exact(client, length)
-            if data is None:
-                break
 
-            received_packets[seq_num] = True
-            received_data[seq_num] = data
+            received_packets[seq] = True
+            received_data[seq] = data
+            retransmitted_packets_received += 1
 
-    # Reassemble file in correct order
-    with open("received.mp3", "wb") as f:
+    print(f"Retransmitted packets received: {retransmitted_packets_received}")
+
+    with open(final_file, "wb") as f:
         for i in range(total_packets):
             if i in received_data:
                 f.write(received_data[i])
 
-    end_time = time.time()
+    with open(final_file, "rb") as f:
+        received_hash = hashlib.md5(f.read()).hexdigest()
 
-    # Verify file integrity
-    received_size = os.path.getsize("received.mp3")
-    received_hash = hashlib.md5(open("received.mp3", "rb").read()).hexdigest()
-
-    print("Download complete")
-    print("Time taken:", end_time - start_time)
-    print(f"Received file size: {received_size} bytes")
-    print(f"Received MD5 hash: {received_hash}")
-
-    # Check for data loss/corruption
-    if received_size != expected_size:
-        print(f"⚠️  SIZE MISMATCH! Expected: {expected_size}, Received: {received_size}")
-        print(f"Data loss: {expected_size - received_size} bytes missing")
-
-    if received_hash != expected_hash:
-        print(f"⚠️  HASH MISMATCH! File may be corrupted")
-        print(f"Expected: {expected_hash}")
-        print(f"Received: {received_hash}")
+    if received_hash == expected_hash:
+        print(f"Received MD5: {received_hash}")
+        print("Integrity OK")
+        if not started:
+            print("Opening downloaded song...")
+            open_downloaded_file(final_file)
     else:
-        print("✅ File integrity verified - no corruption detected")
-
-    # Play (Windows) - only if file seems intact
-    if received_size == expected_size and received_hash == expected_hash:
-        os.system("start received.mp3")
-    else:
-        print("⚠️  Not playing file due to integrity issues")
+        print(f"Received MD5: {received_hash}")
+        print("Corrupted file")
 
 client.close()
